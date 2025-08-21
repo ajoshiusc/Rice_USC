@@ -1,0 +1,11 @@
+nilearn
+monai
+SimpleITK
+jupyterlab
+matplotlib
+nibabel
+numpy
+scipy
+torch
+scipy
+torch
