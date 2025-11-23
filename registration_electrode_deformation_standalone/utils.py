@@ -4,7 +4,7 @@ import SimpleITK as sitk
 from scipy.interpolate import NearestNDInterpolator
 
 
-def multires_registration(fixed_image, moving_image, initial_transform):
+def multires_registration(fixed_image, moving_image, initial_transform, fixed_mask=None):
     registration_method = sitk.ImageRegistrationMethod()
     registration_method.SetMetricAsMattesMutualInformation(
         numberOfHistogramBins=50)
@@ -18,6 +18,9 @@ def multires_registration(fixed_image, moving_image, initial_transform):
     registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
     registration_method.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
     registration_method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+
+    if fixed_mask:
+        registration_method.SetMetricFixedMask(fixed_mask)
 
     final_transform = registration_method.Execute(fixed_image, moving_image)
     print('Final metric value: {0}'.format(

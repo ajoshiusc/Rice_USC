@@ -81,7 +81,7 @@ class Aligner:
             warp_layer = Warp("bilinear", padding_mode="zeros").to(self.device)
 
         reg.train()
-        optimizerR = torch.optim.Adam(reg.parameters(), lr=1e-6)
+        optimizerR = torch.optim.Adam(reg.parameters(), lr=self.lr)
 
         for epoch in range(self.max_epochs):
             optimizerR.zero_grad()
@@ -120,7 +120,7 @@ class Aligner:
     def affine_reg(self, fixed_file, moving_file, output_file, ddf_file, loss='mse', nn_input_size=64, lr=1e-6, max_epochs=5000, device='cuda'):
         self.setLoss(loss)
         self.nn_input_size = nn_input_size
-        self.lr = lr,
+        self.lr = lr
         self.max_epochs = max_epochs
         self.device = device
         self.loadMoving(moving_file)
