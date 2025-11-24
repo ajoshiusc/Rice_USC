@@ -206,3 +206,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 *.nii.gz
+registration_electrode_deformation_standalone/output*
+output*
+.github/agents/BeastMode.agent.md

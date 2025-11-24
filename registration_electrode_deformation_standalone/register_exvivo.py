@@ -1,3 +1,4 @@
+from aligner import Aligner
 import os
 import argparse
 import numpy as np
@@ -83,8 +84,26 @@ def create_atlas_guided_mask(subject_path, atlas_path, affine_transform_path, ou
 def run_registration(fixed_image_path, moving_atlas_path, atlas_labels_path, output_dir, skip_affine=False):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
+    import shutil
 
-    basename = os.path.join(output_dir, "reg")
+    def strip_nii_gz(fname):
+        base = os.path.basename(fname)
+        for ext in ['.nii.gz', '.nii', '.img']:
+            if base.endswith(ext):
+                return base[: -len(ext)]
+        return os.path.splitext(base)[0]
+
+    fixed_base = strip_nii_gz(fixed_image_path)
+    moving_base = strip_nii_gz(moving_atlas_path)
+    labels_base = strip_nii_gz(atlas_labels_path)
+
+    # Copy original files to output directory
+    shutil.copy2(fixed_image_path, os.path.join(output_dir, f"{fixed_base}_orig.nii.gz"))
+    shutil.copy2(moving_atlas_path, os.path.join(output_dir, f"{moving_base}_orig.nii.gz"))
+    shutil.copy2(atlas_labels_path, os.path.join(output_dir, f"{labels_base}_orig.nii.gz"))
+
+    # Use derived base for output prefix
+    basename = os.path.join(output_dir, f"atlas_to_{fixed_base}_reg")
     
     # --- 1. Rigid Registration (SimpleITK) ---
     centered_atlas_path = basename + ".rigid.nii.gz"
@@ -135,71 +154,81 @@ def run_registration(fixed_image_path, moving_atlas_path, atlas_labels_path, out
     # --- 2. Affine Registration (SimpleITK) ---
     affine_atlas_path = basename + ".affine.nii.gz"
     affine_labels_path = basename + ".affine.label.nii.gz"
-    affine_transform_path = basename + ".affine.h5"
+    affine_ddf_path = basename + ".affine_ddf.nii.gz"
 
 
     if skip_affine:
         print("\n--- Step 2: Affine Registration SKIPPED (using rigid only) ---")
         # Use only rigid transform for subsequent steps
-        total_transform = sitk.CompositeTransform(fixed_sitk.GetDimension())
-        total_transform.AddTransform(final_rigid_transform)
-        total_transform.FlattenTransform()
-        # For consistency, save the transform
-        sitk.WriteTransform(total_transform, affine_transform_path)
-        # Resample using rigid only
-        moved_image_affine = sitk.Resample(moving_sitk, fixed_sitk, total_transform)
+        moved_image_affine = sitk.Resample(moving_sitk, fixed_sitk, final_rigid_transform)
         sitk.WriteImage(moved_image_affine, affine_atlas_path)
-        moved_labels_affine = sitk.Resample(labels_sitk, fixed_sitk, total_transform, sitk.sitkNearestNeighbor)
+        moved_labels_affine = sitk.Resample(labels_sitk, fixed_sitk, final_rigid_transform, sitk.sitkNearestNeighbor)
         sitk.WriteImage(moved_labels_affine, affine_labels_path)
     else:
-        print("\n--- Step 2: Affine Registration ---")
-        if not os.path.exists(affine_transform_path):
-            print("\n--- Step 2: Affine Registration ---")
-            # We will register the Rigid-aligned image to the Fixed image using Affine.
-            # This avoids the complexity of initializing Affine with Rigid parameters directly.
-            # Load the Rigid Registered Image (Moving for this step)
-            moving_sitk_rigid = sitk.ReadImage(centered_atlas_path, sitk.sitkFloat32)
-            # Initialize Identity Affine
-            initial_affine = sitk.AffineTransform(fixed_sitk.GetDimension())
-            # Create a mask for Affine Registration using the Rigid Transform
-            print("Creating mask for Affine Registration...")
-            atlas_img = nb.load(moving_atlas_path)
-            atlas_data = atlas_img.get_fdata()
-            atlas_mask_data = (atlas_data > np.percentile(atlas_data[atlas_data > 0], 5)).astype(np.uint8)
-            temp_atlas_mask_path = "temp_atlas_mask_affine.nii.gz"
-            nb.save(nb.Nifti1Image(atlas_mask_data, atlas_img.affine, atlas_img.header), temp_atlas_mask_path)
-            moving_mask_sitk = sitk.ReadImage(temp_atlas_mask_path, sitk.sitkUInt8)
-            rigid_mask_sitk = sitk.Resample(moving_mask_sitk, fixed_sitk, final_rigid_transform, sitk.sitkNearestNeighbor)
-            # Register (Rigid-Space -> Fixed-Space) with Mask
-            final_affine_only, _ = multires_registration(fixed_sitk, moving_sitk_rigid, initial_affine, fixed_mask=rigid_mask_sitk)
-            if os.path.exists(temp_atlas_mask_path): os.remove(temp_atlas_mask_path)
-            # Create Total Composite Transform: Original -> Rigid -> Affine
-            total_transform = sitk.CompositeTransform(fixed_sitk.GetDimension())
-            total_transform.AddTransform(final_affine_only)
-            total_transform.AddTransform(final_rigid_transform)
-            total_transform.FlattenTransform()
-            sitk.WriteTransform(total_transform, affine_transform_path)
-        else:
-            print("\n--- Step 2: Affine Registration ---")
-            print("Affine transform found, skipping registration.")
-            total_transform = sitk.ReadTransform(affine_transform_path)
-        # Resample Original Image using Total Transform (One interpolation step)
-        moved_image_affine = sitk.Resample(moving_sitk, fixed_sitk, total_transform)
-        sitk.WriteImage(moved_image_affine, affine_atlas_path)
-        # Resample Labels using Total Transform
-        moved_labels_affine = sitk.Resample(labels_sitk, fixed_sitk, total_transform, sitk.sitkNearestNeighbor)
-        sitk.WriteImage(moved_labels_affine, affine_labels_path)
+        print("\n--- Step 2: Affine Registration (Deep Learning) ---")
+        aligner = Aligner()
+        aligner.affine_reg(
+            fixed_image_path,
+            centered_atlas_path,  # Use rigid-registered atlas as moving
+            affine_atlas_path,
+            affine_ddf_path,
+            loss='mse',
+            #nn_input_size=64,
+            #lr=1e-4,
+            max_epochs=5000,
+            #device='cuda'
+        )
+        # Warp labels using the affine DDF
+        # Use the same warping utility as in nonlinear_reg for labels
+        from warp_utils import apply_warp
+        import nibabel as nib
+        
+        # Load target to get correct reference shape
+        target_img = nib.load(fixed_image_path)
+        target_data = target_img.get_fdata()
+        target_tensor = torch.from_numpy(target_data).unsqueeze(0).unsqueeze(0).float()
+        
+        # Load rigid-registered labels
+        label_img = nib.load(centered_labels_path)
+        label_data = label_img.get_fdata()
+        label_tensor = torch.from_numpy(label_data).unsqueeze(0).unsqueeze(0).float()
+        
+        # Load affine DDF
+        affine_ddf = nib.load(affine_ddf_path).get_fdata()
+        ddf_tensor = torch.from_numpy(np.moveaxis(affine_ddf, -1, 0)).unsqueeze(0).float()
+        
+        # Warp labels with target reference
+        warped_labels = apply_warp(ddf_tensor, label_tensor, target_tensor, interp_mode="nearest")
+        warped_labels_np = warped_labels[0, 0].detach().cpu().numpy()
+        nib.save(nib.Nifti1Image(warped_labels_np, target_img.affine), affine_labels_path)
 
 
     # --- 3. Mask Generation ---
     print("\n--- Step 3: Mask Generation ---")
     mask_path = basename + ".mask.nii.gz"
-    create_atlas_guided_mask(
-        fixed_image_path, 
-        moving_atlas_path, 
-        affine_transform_path, 
-        mask_path
-    )
+    # Use affine-registered atlas directly for mask generation
+    # Create simple intensity-based mask from affine-registered atlas and fixed image
+    fixed_img = nb.load(fixed_image_path)
+    fixed_data = fixed_img.get_fdata()
+    affine_img = nb.load(affine_atlas_path)
+    affine_data = affine_img.get_fdata()
+    
+    # Create masks from both images
+    fixed_mask = (fixed_data > np.percentile(fixed_data[fixed_data > 0], 5)).astype(np.uint8)
+    affine_mask = (affine_data > np.percentile(affine_data[affine_data > 0], 5)).astype(np.uint8)
+    
+    # Combine masks (intersection)
+    combined_mask = (fixed_mask * affine_mask).astype(np.uint8)
+    
+    # Morphological cleanup
+    combined_mask = ndimage.binary_fill_holes(combined_mask)
+    combined_mask = ndimage.binary_opening(combined_mask, iterations=2)
+    combined_mask = ndimage.binary_dilation(combined_mask, iterations=3)
+    combined_mask = combined_mask.astype(np.uint8)
+    
+    # Save mask
+    nb.save(nb.Nifti1Image(combined_mask, fixed_img.affine), mask_path)
+    print(f"Mask saved to {mask_path}")
 
 
     # --- 4. Nonlinear Registration (Monai/Warper) ---

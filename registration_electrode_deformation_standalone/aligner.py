@@ -50,10 +50,14 @@ class Aligner:
 
     def loadMoving(self, moving_file):
         self.moving, self.moving_meta = LoadImage(image_only=False)(moving_file)
+        # Store affine before EnsureChannelFirst which may modify it
+        self.moving_affine = self.moving.affine.cpu().numpy() if hasattr(self.moving, 'affine') else self.moving_meta.get('affine')
         self.moving = EnsureChannelFirst()(self.moving).to('cpu')
 
     def loadTarget(self, fixed_file):
-        self.target, self.moving_meta = LoadImage(image_only=False)(fixed_file)
+        self.target, self.target_meta = LoadImage(image_only=False)(fixed_file)
+        # Store affine before EnsureChannelFirst which may modify it
+        self.target_affine = self.target.affine.cpu().numpy() if hasattr(self.target, 'affine') else self.target_meta.get('affine')
         self.target = EnsureChannelFirst()(self.target).to('cpu')
 
     def performAffine(self):
@@ -97,6 +101,9 @@ class Aligner:
 
         size_moving = self.moving[0].shape
         size_target = self.target[0].shape
+        
+        print(f"\nDEBUG: ddf_ds min: {ddf_ds.min().item()}, max: {ddf_ds.max().item()}, mean: {ddf_ds.mean().item()}")
+
         ddfx = (Resize(spatial_size=size_target, mode='trilinear')(
             ddf_ds[:, 0])*(size_moving[0]/SZ)).to('cpu')
         ddfy = (Resize(spatial_size=size_target, mode='trilinear')(
@@ -104,18 +111,20 @@ class Aligner:
         ddfz = (Resize(spatial_size=size_target, mode='trilinear')(
             ddf_ds[:, 2])*(size_moving[2]/SZ)).to('cpu')
         self.ddf = torch.cat((ddfx, ddfy, ddfz), dim=0).to('cpu')
+        
+        print(f"DEBUG: self.ddf min: {self.ddf.min().item()}, max: {self.ddf.max().item()}, mean: {self.ddf.mean().item()}")
         del ddf_ds, ddfx, ddfy, ddfz
 
     def saveDeformationField(self, ddf_file):
         nib.save(nib.Nifti1Image(torch.permute(
-            self.ddf, [1, 2, 3, 0]).detach().cpu().numpy(), self.target.affine), ddf_file)
+            self.ddf, [1, 2, 3, 0]).detach().cpu().numpy(), self.target_affine), ddf_file)
 
     def saveWarpedFile(self, output_file):
         # Apply the warp
         image_movedo = apply_warp(
             self.ddf[None, ], self.moving[None, ], self.target[None, ])
         nib.save(nib.Nifti1Image(image_movedo[0, 0].detach(
-        ).cpu().numpy(), self.target.affine), output_file)
+        ).cpu().numpy(), self.target_affine), output_file)
 
     def affine_reg(self, fixed_file, moving_file, output_file, ddf_file, loss='mse', nn_input_size=64, lr=1e-6, max_epochs=5000, device='cuda'):
         self.setLoss(loss)
