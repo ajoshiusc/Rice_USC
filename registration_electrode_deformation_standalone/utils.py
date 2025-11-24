@@ -6,17 +6,21 @@ from scipy.interpolate import NearestNDInterpolator
 
 def multires_registration(fixed_image, moving_image, initial_transform, fixed_mask=None):
     registration_method = sitk.ImageRegistrationMethod()
+    # Increase histogram bins for better mutual information estimation
     registration_method.SetMetricAsMattesMutualInformation(
-        numberOfHistogramBins=50)
+        numberOfHistogramBins=64)
     registration_method.SetMetricSamplingStrategy(registration_method.RANDOM)
-    registration_method.SetMetricSamplingPercentage(0.01)
+    # Increase sampling percentage for more robust estimation
+    registration_method.SetMetricSamplingPercentage(0.05)
     registration_method.SetInterpolator(sitk.sitkLinear)
+    # More iterations per level for better convergence
     registration_method.SetOptimizerAsGradientDescent(
-        learningRate=1.0, numberOfIterations=100, estimateLearningRate=registration_method.Once)
+        learningRate=1.0, numberOfIterations=200, estimateLearningRate=registration_method.Once)
     registration_method.SetOptimizerScalesFromPhysicalShift()
     registration_method.SetInitialTransform(initial_transform, inPlace=False)
-    registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
-    registration_method.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
+    # Add extra coarse level for better global alignment
+    registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[8, 4, 2, 1])
+    registration_method.SetSmoothingSigmasPerLevel(smoothingSigmas=[3, 2, 1, 0])
     registration_method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
 
     if fixed_mask:

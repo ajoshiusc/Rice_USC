@@ -19,7 +19,7 @@ from monai.losses import (
 )
 from nilearn.image import resample_to_img, resample_img, crop_img, load_img
 from torch.nn.functional import grid_sample
-from warp_utils import get_grid, apply_warp, jacobian_determinant
+from warp_utils import get_grid, apply_warp, jacobian_determinant, jacobian_determinant_torch
 from typing import List
 from monai.losses import BendingEnergyLoss
 from deform_losses import BendingEnergyLoss as myBendingEnergyLoss
@@ -27,6 +27,7 @@ from deform_losses import GradEnergyLoss
 from networks import LocalNet2
 import argparse
 import nibabel as nib
+import numpy as np
 
 
 class dscolors:
@@ -120,17 +121,23 @@ class Warper:
         lr=1e-6,
         max_epochs=1000,
         device="cuda",
+        use_diffusion_reg=False,
     ):
         if loss == "mse":
             image_loss = MSELoss()
         elif loss == "cc":
-            image_loss = LocalNormalizedCrossCorrelationLoss(kernel_size=7)
+            # Larger kernel for better subcortical structure capture
+            image_loss = LocalNormalizedCrossCorrelationLoss(kernel_size=13)
         elif loss == "mi":
             image_loss = GlobalMutualInformationLoss()
         else:
             raise AssertionError("Invalid Loss")
 
-        regularization = myBendingEnergyLoss()  # GradEnergyLoss()
+        # Use diffusion (gradient) regularization for smoother local deformations
+        if use_diffusion_reg:
+            regularization = GradEnergyLoss()
+        else:
+            regularization = myBendingEnergyLoss()
         #######################
         set_determinism(42)
         self.loadMoving(moving_file)
@@ -150,68 +157,131 @@ class Warper:
                 self.target_mask
             ).to(device)
 
+        # Improved normalization for cross-protocol T2 (atlas vs ex vivo)
+        # Normalize to [0, 1] with robust percentiles
         moving_ds = ScaleIntensityRangePercentiles(
-            lower=0.5, upper=99.5, b_min=0.0, b_max=10, clip=True
+            lower=1.0, upper=99.0, b_min=0.0, b_max=1.0, clip=True
         )(moving_ds)
         target_ds = ScaleIntensityRangePercentiles(
-            lower=0.5, upper=99.5, b_min=0.0, b_max=10, clip=True
+            lower=1.0, upper=99.0, b_min=0.0, b_max=1.0, clip=True
         )(target_ds)
+        
+        # Apply histogram matching to reduce protocol differences
+        # Match moving (atlas) to target (ex vivo) intensity distribution
+        moving_flat = moving_ds.flatten().cpu().numpy()
+        target_flat = target_ds.flatten().cpu().numpy()
+        
+        # Simple histogram matching using quantiles
+        moving_sorted_idx = np.argsort(moving_flat)
+        target_sorted = np.sort(target_flat)
+        
+        # Map moving intensities to target distribution
+        moving_matched_flat = np.zeros_like(moving_flat)
+        moving_matched_flat[moving_sorted_idx] = target_sorted[
+            (np.arange(len(moving_flat)) * len(target_flat) // len(moving_flat)).clip(0, len(target_flat)-1)
+        ]
+        moving_ds = torch.from_numpy(moving_matched_flat.reshape(moving_ds.shape)).to(device).float()
+        # Improved UNet with instance norm and wider channels
+        # for better feature extraction of subcortical structures
         reg = unet.UNet(
             spatial_dims=3,  # spatial dims
             in_channels=2,
             out_channels=3,  # output channels (to represent 3D displacement vector field)
-            channels=(16, 32, 32, 32, 32),  # channel sequence
-            strides=(1, 2, 2, 4),  # convolutional strides
-            dropout=0.2,
-            norm="batch",
+            channels=(32, 64, 128, 256, 320),  # Wider network for better feature extraction
+            strides=(2, 2, 2, 2),  # convolutional strides
+            norm="instance",  # Instance norm better for registration
+            dropout=0.1,  # Light dropout for regularization
         ).to(device)
         if USE_COMPILED:
             warp_layer = Warp(3, padding_mode="zeros").to(device)
         else:
             warp_layer = Warp("bilinear", padding_mode="zeros").to(device)
         reg.train()
-        optimizerR = torch.optim.Adam(reg.parameters(), lr=lr)
+        # Use AdamW with weight decay for better generalization
+        optimizerR = torch.optim.AdamW(reg.parameters(), lr=lr, weight_decay=1e-5)
+        # Faster LR reduction for ex vivo registration
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizerR, mode='min', factor=0.5, patience=50, min_lr=1e-7
+        )
         print(dscolors.green + "optimizing" + dscolors.clear)
 
         dvf_to_ddf = DVF2DDF()
-
+        
+        # Store original unmasked images for better gradient flow
+        target_ds_orig = target_ds.clone()
+        moving_ds_orig = moving_ds.clone()
+        
+        # Convert mask to soft weights (0.01 outside, 1.0 inside) for better gradient flow
         if target_mask is not None:
-            target_ds *= target_mask_ds
+            mask_weight = target_mask_ds * 0.99 + 0.01
+        
+        # Early stopping
+        best_loss = float('inf')
+        patience_counter = 0
+        early_stop_patience = 200
 
         for epoch in range(max_epochs):
             optimizerR.zero_grad()
-            input_data = torch.cat((moving_ds, target_ds), dim=0)
+            
+            # Use original unmasked images as input for better feature learning
+            input_data = torch.cat((moving_ds_orig, target_ds_orig), dim=0)
             input_data = input_data[None,]
             dvf_ds = reg(input_data)
             ddf_ds = dvf_to_ddf(dvf_ds)
             inv_ddf_ds = dvf_to_ddf(-dvf_ds)
 
-            image_moved = warp_layer(moving_ds[None,], ddf_ds)
+            image_moved = warp_layer(moving_ds_orig[None,], ddf_ds)
 
+            # Apply mask as soft weight in loss computation instead of hard multiplication
             if target_mask is not None:
-                image_moved *= target_mask_ds
-
-            imgloss = image_loss(image_moved, target_ds[None,])
+                # Weighted loss: emphasize brain regions but allow learning outside
+                imgloss = image_loss(image_moved * mask_weight, target_ds_orig[None,] * mask_weight)
+            else:
+                imgloss = image_loss(image_moved, target_ds_orig[None,])
+            
             regloss = reg_penalty * regularization(ddf_ds)
-            vol_loss = imgloss + regloss
+            
+            # Add penalty for folding (negative Jacobian determinant)
+            jac_det = jacobian_determinant_torch(ddf_ds[0])
+            folding_penalty = torch.sum(torch.relu(-jac_det)) * 0.1
+            
+            vol_loss = imgloss + regloss + folding_penalty
 
-            # print('imgloss:'+dscolors.blue+f'{imgloss:.4f}'+dscolors.clear
-            # 			+', regloss:'+dscolors.blue+f'{regloss:.4f}'+dscolors.clear)#, end=' ')
             vol_loss.backward()
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(reg.parameters(), max_norm=1.0)
             optimizerR.step()
-            # print('epoch_loss:'+dscolors.blue+f'{vol_loss:.4f}'+dscolors.clear
-            # 		+' for epoch:'+dscolors.blue+f'{epoch}'+'/'+f'{max_epochs}'+dscolors.clear+'     ',end='\r\033[A')
-            print(
-                "epoch:",
-                dscolors.green,
-                f"{epoch}/{max_epochs}",
-                "Loss:",
-                dscolors.yellow,
-                f"{vol_loss.detach().cpu().numpy():.2f}",
-                dscolors.clear,
-                "",
-                end="\r",
-            )
+            scheduler.step(vol_loss)
+            
+            # Early stopping check
+            if vol_loss.item() < best_loss:
+                best_loss = vol_loss.item()
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            
+            if patience_counter >= early_stop_patience:
+                print(f"\nEarly stopping at epoch {epoch}")
+                break
+            
+            if epoch % 50 == 0:
+                print(
+                    f"\nepoch: {epoch}/{max_epochs}, Loss: {vol_loss.item():.4f}, "
+                    f"ImgLoss: {imgloss.item():.4f}, RegLoss: {regloss.item():.4f}, "
+                    f"Fold: {folding_penalty.item():.4f}, LR: {optimizerR.param_groups[0]['lr']:.2e}"
+                )
+            else:
+                print(
+                    "epoch:",
+                    dscolors.green,
+                    f"{epoch}/{max_epochs}",
+                    "Loss:",
+                    dscolors.yellow,
+                    f"{vol_loss.detach().cpu().numpy():.4f}",
+                    dscolors.clear,
+                    "",
+                    end="\r",
+                )
 
         print("finished", dscolors.green, f"{max_epochs}", dscolors.clear, "epochs")
 
