@@ -1,7 +1,7 @@
 import os
 
 
-subjects = ["r52", "r53", "r57"]
+subjects = ["r52", "r53","r54", "r57", "r59", "r60"]
 
 
 RodentToolsDir = "/home/ajoshi/project2_ajoshi_1183/data/RodentTools"
