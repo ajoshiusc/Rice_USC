@@ -255,7 +255,7 @@ def run_registration(fixed_image_path, moving_atlas_path, atlas_labels_path, out
         max_epochs=5000,      # More epochs with early stopping
         loss="cc",            # Cross-correlation with larger kernel (13)
         use_diffusion_reg=True,  # Use gradient regularization for smoother deformations
-        kernel_size=13,        # Smaller kernel for finer details
+        kernel_size=7,        # Smaller kernel for finer details
     )
 
     print("\n--- Registration Complete ---")
