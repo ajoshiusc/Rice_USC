@@ -249,12 +249,13 @@ def run_registration(fixed_image_path, moving_atlas_path, atlas_labels_path, out
         
         # Optimized Parameters for Ex Vivo to Atlas Registration
         # Focus on hippocampal and subcortical alignment
-        reg_penalty=0.5,      # Reduced regularization for more flexible local deformations
-        nn_input_size=64,    # Higher resolution to preserve hippocampal boundaries
+        reg_penalty=0.15,      # Reduced regularization for more flexible local deformations
+        nn_input_size=128,    # Higher resolution to preserve hippocampal boundaries
         lr=2e-4,              # Higher initial LR with adaptive schedule
         max_epochs=5000,      # More epochs with early stopping
         loss="cc",            # Cross-correlation with larger kernel (13)
         use_diffusion_reg=True,  # Use gradient regularization for smoother deformations
+        kernel_size=13,        # Smaller kernel for finer details
     )
 
     print("\n--- Registration Complete ---")

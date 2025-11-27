@@ -1,5 +1,5 @@
-sub_bse_t2 = "/home/ajoshi/project2_ajoshi_1183/data/RodentTools/for_Seymour/11_15_2025/MRI/Raw T2/r53/r53.reoriented.bse.nii.gz" #subbase+".bfc.nii.gz"
-outdir = "/home/ajoshi/project2_ajoshi_1183/data/RodentTools/for_Seymour/11_15_2025/MRI/Completed Atlases/r53"
+sub_bse_t2 = "/home/ajoshi/project2_ajoshi_1183/data/RodentTools/for_Seymour/11_15_2025/MRI/Raw T2/r52/r52.reoriented.bse.nii.gz" #subbase+".bfc.nii.gz"
+outdir = "/home/ajoshi/project2_ajoshi_1183/data/RodentTools/for_Seymour/11_15_2025/MRI/Completed Atlases/r52_128_gemini_13"
 
 
 atlas_bse_t2 = "/deneb_disk/RodentTools/Atlases/Waxholm/WHS_SD_rat_atlas_v4_pack/WHS_SD_rat_T2star_v1.01.bse.nii.gz"

@@ -122,12 +122,13 @@ class Warper:
         max_epochs=1000,
         device="cuda",
         use_diffusion_reg=False,
+        kernel_size=7,
     ):
         if loss == "mse":
             image_loss = MSELoss()
         elif loss == "cc":
             # Larger kernel for better subcortical structure capture
-            image_loss = LocalNormalizedCrossCorrelationLoss(kernel_size=13)
+            image_loss = LocalNormalizedCrossCorrelationLoss(kernel_size=kernel_size)
         elif loss == "mi":
             image_loss = GlobalMutualInformationLoss()
         else:
