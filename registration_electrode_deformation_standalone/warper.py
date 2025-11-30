@@ -28,6 +28,8 @@ from networks import LocalNet2
 import argparse
 import nibabel as nib
 import numpy as np
+import copy
+import os
 
 
 class dscolors:
@@ -138,52 +140,18 @@ class Warper:
         if use_diffusion_reg:
             regularization = GradEnergyLoss()
         else:
-            regularization = myBendingEnergyLoss()
+            regularization = myBendingEnergyLoss(normalize=True)
         #######################
         set_determinism(42)
         self.loadMoving(moving_file)
         self.loadTarget(target_file)
         self.loadTargetMask(target_mask)
 
-        SZ = nn_input_size
-        moving_ds = Resize(spatial_size=[SZ, SZ, SZ], mode="trilinear")(self.moving).to(
-            device
-        )
-        target_ds = Resize(spatial_size=[SZ, SZ, SZ], mode="trilinear")(self.target).to(
-            device
-        )
-
-        if target_mask is not None:
-            target_mask_ds = Resize(spatial_size=[SZ, SZ, SZ], mode="trilinear")(
-                self.target_mask
-            ).to(device)
-
-        # Improved normalization for cross-protocol T2 (atlas vs ex vivo)
-        # Normalize to [0, 1] with robust percentiles
-        moving_ds = ScaleIntensityRangePercentiles(
-            lower=1.0, upper=99.0, b_min=0.0, b_max=1.0, clip=True
-        )(moving_ds)
-        target_ds = ScaleIntensityRangePercentiles(
-            lower=1.0, upper=99.0, b_min=0.0, b_max=1.0, clip=True
-        )(target_ds)
+        # Hierarchical Registration
+        # scales = [nn_input_size // 2, nn_input_size]
+        scales = [int(nn_input_size/2), int(nn_input_size*0.75), nn_input_size]
         
-        # Apply histogram matching to reduce protocol differences
-        # Match moving (atlas) to target (ex vivo) intensity distribution
-        moving_flat = moving_ds.flatten().cpu().numpy()
-        target_flat = target_ds.flatten().cpu().numpy()
-        
-        # Simple histogram matching using quantiles
-        moving_sorted_idx = np.argsort(moving_flat)
-        target_sorted = np.sort(target_flat)
-        
-        # Map moving intensities to target distribution
-        moving_matched_flat = np.zeros_like(moving_flat)
-        moving_matched_flat[moving_sorted_idx] = target_sorted[
-            (np.arange(len(moving_flat)) * len(target_flat) // len(moving_flat)).clip(0, len(target_flat)-1)
-        ]
-        moving_ds = torch.from_numpy(moving_matched_flat.reshape(moving_ds.shape)).to(device).float()
-        # Improved UNet with instance norm and wider channels
-        # for better feature extraction of subcortical structures
+        # Initialize UNet once
         reg = unet.UNet(
             spatial_dims=3,  # spatial dims
             in_channels=2,
@@ -193,96 +161,217 @@ class Warper:
             norm="instance",  # Instance norm better for registration
             dropout=0.1,  # Light dropout for regularization
         ).to(device)
+        
         if USE_COMPILED:
             warp_layer = Warp(3, padding_mode="zeros").to(device)
         else:
             warp_layer = Warp("bilinear", padding_mode="zeros").to(device)
-        reg.train()
-        # Use AdamW with weight decay for better generalization
-        optimizerR = torch.optim.AdamW(reg.parameters(), lr=lr, weight_decay=1e-5)
-        # Faster LR reduction for ex vivo registration
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizerR, mode='min', factor=0.5, patience=50, min_lr=1e-7
-        )
-        print(dscolors.green + "optimizing" + dscolors.clear)
-
-        dvf_to_ddf = DVF2DDF()
-        
-        # Store original unmasked images for better gradient flow
-        target_ds_orig = target_ds.clone()
-        moving_ds_orig = moving_ds.clone()
-        
-        # Convert mask to soft weights (0.01 outside, 1.0 inside) for better gradient flow
-        if target_mask is not None:
-            mask_weight = target_mask_ds * 0.99 + 0.01
-        
-        # Early stopping
-        best_loss = float('inf')
-        patience_counter = 0
-        early_stop_patience = 200
-
-        for epoch in range(max_epochs):
-            optimizerR.zero_grad()
             
-            # Use original unmasked images as input for better feature learning
+        # dvf_to_ddf = DVF2DDF()
+
+        for scale_idx, SZ in enumerate(scales):
+            print(dscolors.cyan + f"\n--- Processing Scale {scale_idx+1}/{len(scales)}: {SZ}x{SZ}x{SZ} ---" + dscolors.clear)
+            
+            # Scale regularization penalty based on resolution
+            # We want stronger regularization at coarse scales (to prevent folding)
+            # and weaker at fine scales (to allow details).
+            # Scaling by (nn_input_size / SZ)**2 keeps the physical smoothness constraint roughly constant
+            # relative to the image loss, while allowing natural relaxation at fine scales.
+            current_reg_penalty = reg_penalty * (nn_input_size / SZ) ** 2
+            print(f"Current Reg Penalty: {current_reg_penalty:.6f}")
+
+            moving_ds = Resize(spatial_size=[SZ, SZ, SZ], mode="trilinear")(self.moving).to(device)
+            target_ds = Resize(spatial_size=[SZ, SZ, SZ], mode="trilinear")(self.target).to(device)
+
+            if target_mask is not None:
+                target_mask_ds = Resize(spatial_size=[SZ, SZ, SZ], mode="trilinear")(self.target_mask).to(device)
+
+            # Normalize
+            moving_ds = ScaleIntensityRangePercentiles(lower=1.0, upper=99.0, b_min=0.0, b_max=1.0, clip=True)(moving_ds)
+            target_ds = ScaleIntensityRangePercentiles(lower=1.0, upper=99.0, b_min=0.0, b_max=1.0, clip=True)(target_ds)
+            
+            # Histogram matching
+            moving_flat = moving_ds.flatten().cpu().numpy()
+            target_flat = target_ds.flatten().cpu().numpy()
+            moving_sorted_idx = np.argsort(moving_flat)
+            target_sorted = np.sort(target_flat)
+            moving_matched_flat = np.zeros_like(moving_flat)
+            moving_matched_flat[moving_sorted_idx] = target_sorted[
+                (np.arange(len(moving_flat)) * len(target_flat) // len(moving_flat)).clip(0, len(target_flat)-1)
+            ]
+            moving_ds = torch.from_numpy(moving_matched_flat.reshape(moving_ds.shape)).to(device).float()
+
+            reg.train()
+            # Re-initialize optimizer for each scale to reset momentum/adaptive rates
+            # Decay initial LR for finer scales to prevent jumping out of minima
+            current_lr = lr * (0.8 ** scale_idx)
+            
+            # Scale weights of the final layer to account for resolution change
+            # This ensures the network output (voxel displacement) roughly matches physical scale
+            if scale_idx > 0:
+                prev_SZ = scales[scale_idx-1]
+                scale_factor = SZ / prev_SZ
+                with torch.no_grad():
+                    reg.model[-1].conv.weight.data *= scale_factor
+                    if reg.model[-1].conv.bias is not None:
+                        reg.model[-1].conv.bias.data *= scale_factor
+                print(dscolors.yellow + f"Scaled final layer weights by {scale_factor:.2f} for resolution change" + dscolors.clear)
+
+            optimizerR = torch.optim.AdamW(reg.parameters(), lr=current_lr, weight_decay=1e-5)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizerR, mode='min', factor=0.5, patience=100, min_lr=1e-7
+            )
+            
+            target_ds_orig = target_ds.clone()
+            moving_ds_orig = moving_ds.clone()
+            
+            if target_mask is not None:
+                mask_weight = target_mask_ds * 0.99 + 0.01
+            
+            best_loss = float('inf')
+            patience_counter = 0
+            early_stop_patience = 500
+            best_model_wts = copy.deepcopy(reg.state_dict())
+            best_metric_epoch = -1
+            
+            # Adjust epochs per scale: fewer for coarse, more for fine
+            if scale_idx == 0:
+                current_max_epochs = int(max_epochs * 0.5)
+            elif scale_idx == 1:
+                current_max_epochs = int(max_epochs * 0.75)
+            else:
+                current_max_epochs = max_epochs
+
+            for epoch in range(current_max_epochs):
+                optimizerR.zero_grad()
+                input_data = torch.cat((moving_ds_orig, target_ds_orig), dim=0)
+                input_data = input_data[None,]
+                # Direct prediction of Displacement Field (DDF)
+                ddf_ds = reg(input_data)
+                # ddf_ds = dvf_to_ddf(dvf_ds)
+                
+                # Use warp_utils.apply_warp to ensure consistency with saving/inference (Voxel Coordinates)
+                # MONAI's Warp block uses normalized coordinates [-1, 1], which causes a mismatch
+                # if the network learns normalized values but we interpret them as voxels later.
+                image_moved = apply_warp(ddf_ds, moving_ds_orig[None,], target_ds_orig[None,])
+
+                if target_mask is not None:
+                    imgloss = image_loss(image_moved * mask_weight, target_ds_orig[None,] * mask_weight)
+                else:
+                    imgloss = image_loss(image_moved, target_ds_orig[None,])
+                
+                regloss = current_reg_penalty * regularization(ddf_ds)
+                
+                jac_det = jacobian_determinant_torch(ddf_ds[0])
+                folding_penalty = torch.sum(torch.relu(-jac_det)) * 0.001
+                
+                vol_loss = imgloss + regloss + folding_penalty
+
+                vol_loss.backward()
+                torch.nn.utils.clip_grad_norm_(reg.parameters(), max_norm=1.0)
+                optimizerR.step()
+                scheduler.step(vol_loss)
+                
+                if vol_loss.item() < best_loss:
+                    best_loss = vol_loss.item()
+                    patience_counter = 0
+                    best_model_wts = copy.deepcopy(reg.state_dict())
+                    best_metric_epoch = epoch
+                else:
+                    patience_counter += 1
+                
+                if patience_counter >= early_stop_patience:
+                    print(f"\nEarly stopping at epoch {epoch}")
+                    break
+                
+                if (epoch + 1) % 200 == 0:
+                    # Save intermediate result
+                    with torch.no_grad():
+                        # Define intermediate dir near target file
+                        inter_dir = os.path.join(os.path.dirname(output_file), "intermediate")
+                        os.makedirs(inter_dir, exist_ok=True)
+
+                        # Save Fixed Image (once)
+                        fixed_save_path = os.path.join(inter_dir, "fixed.nii.gz")
+                        if not os.path.exists(fixed_save_path):
+                            nib.save(nib.Nifti1Image(self.target[0].cpu().numpy(), self.target.affine), fixed_save_path)
+
+                        # Save Mask (once)
+                        if target_mask is not None:
+                            mask_save_path = os.path.join(inter_dir, "mask.nii.gz")
+                            if not os.path.exists(mask_save_path):
+                                # Convert bool to uint8 for saving
+                                mask_data = self.target_mask[0].cpu().numpy().astype(np.uint8)
+                                nib.save(nib.Nifti1Image(mask_data, self.target.affine), mask_save_path)
+
+                        # Upsample DDF to original resolution for correct overlay
+                        size_moving = self.moving[0].shape
+                        size_target = self.target[0].shape
+                        
+                        # Resize DDF to target shape
+                        # ddf_ds is (1, 3, SZ, SZ, SZ) -> (3, SZ, SZ, SZ) for Resize
+                        # Resize expects (C, H, W, D)
+                        ddf_up = Resize(spatial_size=size_target, mode="trilinear")(ddf_ds[0].cpu())
+                        
+                        # Add batch dim back: (1, 3, H, W, D)
+                        ddf_up = ddf_up[None, ...]
+                        
+                        # Scale DDF values from SZ voxel space to Original voxel space
+                        scale_factors = [
+                            size_moving[0] / SZ,
+                            size_moving[1] / SZ,
+                            size_moving[2] / SZ
+                        ]
+                        for i in range(3):
+                            ddf_up[:, i] *= scale_factors[i]
+                        
+                        # Apply warp to original moving image
+                        image_moved_intermediate = apply_warp(ddf_up, self.moving[None,], self.target[None,])
+                        
+                        # Save warped moving image
+                        save_name = f"moved_scale_{scale_idx+1}_epoch_{epoch+1}.nii.gz"
+                        save_path = os.path.join(inter_dir, save_name)
+                        
+                        nib.save(
+                            nib.Nifti1Image(
+                                image_moved_intermediate[0, 0].cpu().numpy(), 
+                                self.target.affine
+                            ),
+                            save_path,
+                        )
+                        print(f"\nSaved intermediate result to {save_path}")
+
+                if epoch % 50 == 0:
+                    print(
+                        f"\nScale {scale_idx+1} epoch: {epoch}/{current_max_epochs}, Loss: {vol_loss.item():.4f}, "
+                        f"ImgLoss: {imgloss.item():.4f}, RegLoss: {regloss.item():.4f}, "
+                        f"Fold: {folding_penalty.item():.4f}, LR: {optimizerR.param_groups[0]['lr']:.2e}"
+                    )
+                else:
+                    print(
+                        f"Scale {scale_idx+1} epoch:",
+                        dscolors.green,
+                        f"{epoch}/{current_max_epochs}",
+                        "Loss:",
+                        dscolors.yellow,
+                        f"{vol_loss.detach().cpu().numpy():.4f}",
+                        dscolors.clear,
+                        "",
+                        end="\r",
+                    )
+            
+            # Load best model weights for this scale
+            print(f"\nLoading best model weights from epoch {best_metric_epoch} with loss {best_loss:.4f}")
+            reg.load_state_dict(best_model_wts)
+        
+        # Final inference to get fields for saving
+        with torch.no_grad():
             input_data = torch.cat((moving_ds_orig, target_ds_orig), dim=0)
             input_data = input_data[None,]
-            dvf_ds = reg(input_data)
-            ddf_ds = dvf_to_ddf(dvf_ds)
-            inv_ddf_ds = dvf_to_ddf(-dvf_ds)
-
-            image_moved = warp_layer(moving_ds_orig[None,], ddf_ds)
-
-            # Apply mask as soft weight in loss computation instead of hard multiplication
-            if target_mask is not None:
-                # Weighted loss: emphasize brain regions but allow learning outside
-                imgloss = image_loss(image_moved * mask_weight, target_ds_orig[None,] * mask_weight)
-            else:
-                imgloss = image_loss(image_moved, target_ds_orig[None,])
-            
-            regloss = reg_penalty * regularization(ddf_ds)
-            
-            # Add penalty for folding (negative Jacobian determinant)
-            jac_det = jacobian_determinant_torch(ddf_ds[0])
-            folding_penalty = torch.sum(torch.relu(-jac_det)) * 0.1
-            
-            vol_loss = imgloss + regloss + folding_penalty
-
-            vol_loss.backward()
-            # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(reg.parameters(), max_norm=1.0)
-            optimizerR.step()
-            scheduler.step(vol_loss)
-            
-            # Early stopping check
-            if vol_loss.item() < best_loss:
-                best_loss = vol_loss.item()
-                patience_counter = 0
-            else:
-                patience_counter += 1
-            
-            if patience_counter >= early_stop_patience:
-                print(f"\nEarly stopping at epoch {epoch}")
-                break
-            
-            if epoch % 50 == 0:
-                print(
-                    f"\nepoch: {epoch}/{max_epochs}, Loss: {vol_loss.item():.4f}, "
-                    f"ImgLoss: {imgloss.item():.4f}, RegLoss: {regloss.item():.4f}, "
-                    f"Fold: {folding_penalty.item():.4f}, LR: {optimizerR.param_groups[0]['lr']:.2e}"
-                )
-            else:
-                print(
-                    "epoch:",
-                    dscolors.green,
-                    f"{epoch}/{max_epochs}",
-                    "Loss:",
-                    dscolors.yellow,
-                    f"{vol_loss.detach().cpu().numpy():.4f}",
-                    dscolors.clear,
-                    "",
-                    end="\r",
-                )
+            ddf_ds = reg(input_data)
+            # ddf_ds = dvf_to_ddf(dvf_ds)
+            # inv_ddf_ds = dvf_to_ddf(-dvf_ds)
+            image_moved = apply_warp(ddf_ds, moving_ds_orig[None,], target_ds_orig[None,])
 
         print("finished", dscolors.green, f"{max_epochs}", dscolors.clear, "epochs")
 
@@ -309,20 +398,20 @@ class Warper:
         self.ddf = torch.cat((ddfx, ddfy, ddfz), dim=0)
         del ddf_ds, ddfx, ddfy, ddfz
 
-        print(dscolors.green + "computing inverse deformation field" + dscolors.clear)
-        size_moving = self.moving[0].shape
-        size_target = self.target[0].shape
-        ddfx = Resize(spatial_size=size_moving, mode="trilinear")(inv_ddf_ds[:, 0].to('cpu')).to('cpu') * (
-            size_target[0] / SZ
-        )
-        ddfy = Resize(spatial_size=size_moving, mode="trilinear")(inv_ddf_ds[:, 1].to('cpu')).to('cpu') * (
-            size_target[1] / SZ
-        )
-        ddfz = Resize(spatial_size=size_moving, mode="trilinear")(inv_ddf_ds[:, 2].to('cpu')).to('cpu') * (
-            size_target[2] / SZ
-        )
-        self.inv_ddf = torch.cat((ddfx, ddfy, ddfz), dim=0).to('cpu')
-        del inv_ddf_ds, ddfx, ddfy, ddfz
+        # print(dscolors.green + "computing inverse deformation field" + dscolors.clear)
+        # size_moving = self.moving[0].shape
+        # size_target = self.target[0].shape
+        # ddfx = Resize(spatial_size=size_moving, mode="trilinear")(inv_ddf_ds[:, 0].to('cpu')).to('cpu') * (
+        #     size_target[0] / SZ
+        # )
+        # ddfy = Resize(spatial_size=size_moving, mode="trilinear")(inv_ddf_ds[:, 1].to('cpu')).to('cpu') * (
+        #     size_target[1] / SZ
+        # )
+        # ddfz = Resize(spatial_size=size_moving, mode="trilinear")(inv_ddf_ds[:, 2].to('cpu')).to('cpu') * (
+        #     size_target[2] / SZ
+        # )
+        # self.inv_ddf = torch.cat((ddfx, ddfy, ddfz), dim=0).to('cpu')
+        # del inv_ddf_ds, ddfx, ddfy, ddfz
 
         # Apply the warp
         print(dscolors.green + "applying warp" + dscolors.clear)

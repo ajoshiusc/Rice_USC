@@ -166,41 +166,47 @@ def run_registration(fixed_image_path, moving_atlas_path, atlas_labels_path, out
         sitk.WriteImage(moved_labels_affine, affine_labels_path)
     else:
         print("\n--- Step 2: Affine Registration (Deep Learning) ---")
-        aligner = Aligner()
-        aligner.affine_reg(
-            fixed_image_path,
-            centered_atlas_path,  # Use rigid-registered atlas as moving
-            affine_atlas_path,
-            affine_ddf_path,
-            loss='mse',
-            #nn_input_size=64,
-            #lr=1e-4,
-            max_epochs=5000,
-            #device='cuda'
-        )
+        if os.path.exists(affine_atlas_path) and os.path.exists(affine_ddf_path):
+            print("Affine registration files found, skipping registration.")
+        else:
+            aligner = Aligner()
+            aligner.affine_reg(
+                fixed_image_path,
+                centered_atlas_path,  # Use rigid-registered atlas as moving
+                affine_atlas_path,
+                affine_ddf_path,
+                loss='mse',
+                #nn_input_size=64,
+                #lr=1e-4,
+                max_epochs=5000,
+                #device='cuda'
+            )
         # Warp labels using the affine DDF
-        # Use the same warping utility as in nonlinear_reg for labels
-        from warp_utils import apply_warp
-        import nibabel as nib
-        
-        # Load target to get correct reference shape
-        target_img = nib.load(fixed_image_path)
-        target_data = target_img.get_fdata()
-        target_tensor = torch.from_numpy(target_data).unsqueeze(0).unsqueeze(0).float()
-        
-        # Load rigid-registered labels
-        label_img = nib.load(centered_labels_path)
-        label_data = label_img.get_fdata()
-        label_tensor = torch.from_numpy(label_data).unsqueeze(0).unsqueeze(0).float()
-        
-        # Load affine DDF
-        affine_ddf = nib.load(affine_ddf_path).get_fdata()
-        ddf_tensor = torch.from_numpy(np.moveaxis(affine_ddf, -1, 0)).unsqueeze(0).float()
-        
-        # Warp labels with target reference
-        warped_labels = apply_warp(ddf_tensor, label_tensor, target_tensor, interp_mode="nearest")
-        warped_labels_np = warped_labels[0, 0].detach().cpu().numpy()
-        nib.save(nib.Nifti1Image(warped_labels_np, target_img.affine), affine_labels_path)
+        if os.path.exists(affine_labels_path):
+            print("Affine labels found, skipping label warping.")
+        else:
+            # Use the same warping utility as in nonlinear_reg for labels
+            from warp_utils import apply_warp
+            import nibabel as nib
+            
+            # Load target to get correct reference shape
+            target_img = nib.load(fixed_image_path)
+            target_data = target_img.get_fdata()
+            target_tensor = torch.from_numpy(target_data).unsqueeze(0).unsqueeze(0).float()
+            
+            # Load rigid-registered labels
+            label_img = nib.load(centered_labels_path)
+            label_data = label_img.get_fdata()
+            label_tensor = torch.from_numpy(label_data).unsqueeze(0).unsqueeze(0).float()
+            
+            # Load affine DDF
+            affine_ddf = nib.load(affine_ddf_path).get_fdata()
+            ddf_tensor = torch.from_numpy(np.moveaxis(affine_ddf, -1, 0)).unsqueeze(0).float()
+            
+            # Warp labels with target reference
+            warped_labels = apply_warp(ddf_tensor, label_tensor, target_tensor, interp_mode="nearest")
+            warped_labels_np = warped_labels[0, 0].detach().cpu().numpy()
+            nib.save(nib.Nifti1Image(warped_labels_np, target_img.affine), affine_labels_path)
 
 
     # --- 3. Mask Generation ---
@@ -249,13 +255,13 @@ def run_registration(fixed_image_path, moving_atlas_path, atlas_labels_path, out
         
         # Optimized Parameters for Ex Vivo to Atlas Registration
         # Focus on hippocampal and subcortical alignment
-        reg_penalty=0.15,      # Reduced regularization for more flexible local deformations
+        reg_penalty=1e-6,     # Extremely low regularization to maximize internal deformation
         nn_input_size=128,    # Higher resolution to preserve hippocampal boundaries
-        lr=2e-4,              # Higher initial LR with adaptive schedule
-        max_epochs=5000,      # More epochs with early stopping
-        loss="cc",            # Cross-correlation with larger kernel (13)
-        use_diffusion_reg=True,  # Use gradient regularization for smoother deformations
-        kernel_size=13,        # Smaller kernel for finer details
+        lr=.01,              # Higher initial LR to encourage movement
+        max_epochs=2000,      # More epochs to allow convergence at fine scales
+        loss="cc",            # Cross-correlation with larger kernel
+        use_diffusion_reg=False,  # Use gradient regularization for smoother deformations
+        kernel_size=15,       # Larger kernel (15) to capture broader context for internal alignment
     )
 
     print("\n--- Registration Complete ---")
