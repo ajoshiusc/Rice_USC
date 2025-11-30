@@ -22,7 +22,7 @@ def run_test(sub_bse_t2, output_dir):
 
 if __name__ == "__main__":
     for subj in subjects:
-        sub_bse_t2 = f"{RAW_BASE}{subj}/{subj}.reoriented.bfc.nii.gz"
+        sub_bse_t2 = f"{RAW_BASE}{subj}/{subj}.reoriented.bse.nii.gz"
         outdir = f"{OUT_BASE}{subj}"
         print(f"\n--- Processing {subj} ---")
         run_test(sub_bse_t2, outdir)
