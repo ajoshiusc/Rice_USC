@@ -126,16 +126,6 @@ class Warper:
         use_diffusion_reg=False,
         kernel_size=7,
     ):
-        if loss == "mse":
-            image_loss = MSELoss()
-        elif loss == "cc":
-            # Larger kernel for better subcortical structure capture
-            image_loss = LocalNormalizedCrossCorrelationLoss(kernel_size=kernel_size)
-        elif loss == "mi":
-            image_loss = GlobalMutualInformationLoss()
-        else:
-            raise AssertionError("Invalid Loss")
-
         # Use diffusion (gradient) regularization for smoother local deformations
         if use_diffusion_reg:
             regularization = GradEnergyLoss()
@@ -172,6 +162,22 @@ class Warper:
         for scale_idx, SZ in enumerate(scales):
             print(dscolors.cyan + f"\n--- Processing Scale {scale_idx+1}/{len(scales)}: {SZ}x{SZ}x{SZ} ---" + dscolors.clear)
             
+            # Update Loss Kernel Size for current resolution
+            if loss == "cc":
+                # Scale kernel size to maintain constant physical receptive field
+                # Base kernel_size is for nn_input_size (finest scale)
+                current_kernel_size = int(kernel_size * (SZ / nn_input_size))
+                # Ensure odd and at least 3
+                if current_kernel_size % 2 == 0:
+                    current_kernel_size += 1
+                current_kernel_size = max(3, current_kernel_size)
+                print(f"Scaled LNCC Kernel Size: {current_kernel_size} (Base: {kernel_size})")
+                image_loss = LocalNormalizedCrossCorrelationLoss(kernel_size=current_kernel_size)
+            elif loss == "mse":
+                image_loss = MSELoss()
+            elif loss == "mi":
+                image_loss = GlobalMutualInformationLoss()
+
             # Scale regularization penalty based on resolution
             # We want stronger regularization at coarse scales (to prevent folding)
             # and weaker at fine scales (to allow details).
@@ -208,14 +214,14 @@ class Warper:
             
             # Scale weights of the final layer to account for resolution change
             # This ensures the network output (voxel displacement) roughly matches physical scale
-            if scale_idx > 0:
-                prev_SZ = scales[scale_idx-1]
-                scale_factor = SZ / prev_SZ
-                with torch.no_grad():
-                    reg.model[-1].conv.weight.data *= scale_factor
-                    if reg.model[-1].conv.bias is not None:
-                        reg.model[-1].conv.bias.data *= scale_factor
-                print(dscolors.yellow + f"Scaled final layer weights by {scale_factor:.2f} for resolution change" + dscolors.clear)
+            # if scale_idx > 0:
+            #     prev_SZ = scales[scale_idx-1]
+            #     scale_factor = SZ / prev_SZ
+            #     with torch.no_grad():
+            #         reg.model[-1].conv.weight.data *= scale_factor
+            #         if reg.model[-1].conv.bias is not None:
+            #             reg.model[-1].conv.bias.data *= scale_factor
+            #     print(dscolors.yellow + f"Scaled final layer weights by {scale_factor:.2f} for resolution change" + dscolors.clear)
 
             optimizerR = torch.optim.AdamW(reg.parameters(), lr=current_lr, weight_decay=1e-5)
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
