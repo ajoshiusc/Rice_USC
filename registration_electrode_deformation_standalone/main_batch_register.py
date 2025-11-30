@@ -10,7 +10,7 @@ if not os.path.exists(RodentToolsDir):
     RodentToolsDir = "/project2/ajoshi_1183/data/RodentTools"
 
 RAW_BASE = f"{RodentToolsDir}/for_Seymour/11_15_2025/MRI/Raw T2/"
-OUT_BASE = f"{RodentToolsDir}/for_Seymour/11_15_2025/MRI/CompletedAtlases/"
+OUT_BASE = f"{RodentToolsDir}/for_Seymour/11_15_2025/MRI/CompletedAtlases_new_11_29_2025/"
 
 atlas_bse_t2 = f"{RodentToolsDir}/Atlases/Waxholm/WHS_SD_rat_atlas_v4_pack/WHS_SD_rat_T2star_v1.01.bse.nii.gz"
 atlas_labels = f"{RodentToolsDir}/Atlases/Waxholm/WHS_SD_rat_atlas_v4.01.nii.gz"
