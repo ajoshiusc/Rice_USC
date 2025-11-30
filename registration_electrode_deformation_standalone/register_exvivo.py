@@ -81,6 +81,26 @@ def create_atlas_guided_mask(subject_path, atlas_path, affine_transform_path, ou
     print(f"Mask saved to {output_mask_path}")
     return output_mask_path
 
+def bias_field_correction(image_path, output_path):
+    print(f"Applying N4 Bias Field Correction to {image_path}...")
+    if os.path.exists(output_path):
+        print(f"Bias corrected image already exists at {output_path}, skipping.")
+        return output_path
+        
+    input_image = sitk.ReadImage(image_path, sitk.sitkFloat32)
+    
+    # Create a mask for bias field correction (simple thresholding)
+    mask_image = sitk.OtsuThreshold(input_image, 0, 1, 200)
+    
+    corrector = sitk.N4BiasFieldCorrectionImageFilter()
+    corrector.SetMaximumNumberOfIterations([50, 50, 50, 50])
+    
+    output_image = corrector.Execute(input_image, mask_image)
+    
+    sitk.WriteImage(output_image, output_path)
+    print(f"Bias corrected image saved to {output_path}")
+    return output_path
+
 def run_registration(fixed_image_path, moving_atlas_path, atlas_labels_path, output_dir, skip_affine=False):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -101,6 +121,10 @@ def run_registration(fixed_image_path, moving_atlas_path, atlas_labels_path, out
     shutil.copy2(fixed_image_path, os.path.join(output_dir, f"{fixed_base}_orig.nii.gz"))
     shutil.copy2(moving_atlas_path, os.path.join(output_dir, f"{moving_base}_orig.nii.gz"))
     shutil.copy2(atlas_labels_path, os.path.join(output_dir, f"{labels_base}_orig.nii.gz"))
+
+    # Perform Bias Field Correction on Fixed Image
+    corrected_fixed_path = os.path.join(output_dir, f"{fixed_base}_corrected.nii.gz")
+    fixed_image_path = bias_field_correction(fixed_image_path, corrected_fixed_path)
 
     # Use derived base for output prefix
     basename = os.path.join(output_dir, f"atlas_to_{fixed_base}_reg")
@@ -255,7 +279,7 @@ def run_registration(fixed_image_path, moving_atlas_path, atlas_labels_path, out
         
         # Optimized Parameters for Ex Vivo to Atlas Registration
         # Focus on hippocampal and subcortical alignment
-        reg_penalty=1e-6,     # Extremely low regularization to maximize internal deformation
+        reg_penalty=1e-5,     # Extremely low regularization to maximize internal deformation
         nn_input_size=128,    # Higher resolution to preserve hippocampal boundaries
         lr=.01,              # Higher initial LR to encourage movement
         max_epochs=2000,      # More epochs to allow convergence at fine scales

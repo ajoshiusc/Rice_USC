@@ -139,7 +139,7 @@ class Warper:
 
         # Hierarchical Registration
         # scales = [nn_input_size // 2, nn_input_size]
-        scales = [int(nn_input_size/2), int(nn_input_size*0.75), nn_input_size]
+        scales = [int(nn_input_size/4.0), int(nn_input_size*0.5), nn_input_size]
         
         # Initialize UNet once
         reg = unet.UNet(
@@ -210,7 +210,7 @@ class Warper:
             reg.train()
             # Re-initialize optimizer for each scale to reset momentum/adaptive rates
             # Decay initial LR for finer scales to prevent jumping out of minima
-            current_lr = lr * (0.8 ** scale_idx)
+            current_lr = lr * (0.5 ** scale_idx)
             
             # Scale weights of the final layer to account for resolution change
             # This ensures the network output (voxel displacement) roughly matches physical scale
